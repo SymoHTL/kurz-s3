@@ -1,0 +1,1052 @@
+// A small S3-style storage server over the HTTP server of Kurz's standard library, each request signed with SigV4 by the one key
+// its environment gives at start: a bucket is a directory under the root, an object a file in it named by
+// the hex of its key, beside a file that holds its ETag, the hex of the MD5 of its bytes in quotes, as S3 gives a single-part object.
+
+// The bucket and the key a path names, `/bucket/key`, each empty where the path names none.
+data Target(string Bucket, string Key)
+
+Target Parse(string path) {
+    if path.Bytes.Count <= 1 {
+        return Target("", "")
+    }
+
+    rest = path.Substring(1, path.Bytes.Count - 1)
+    at = rest.IndexOf("/")
+    if at == null {
+        return Target(rest, "")
+    }
+
+    return Target(rest.Substring(0, at), rest.Substring(at + 1, rest.Bytes.Count - at - 1))
+}
+
+// An error as S3 writes one: its status, and its code and message as XML.
+HttpResponse Failure(int status, string code, string message) {
+    r = HttpResponse.Text(status, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{message}</Message></Error>")
+    r.Headers.Set("Content-Type", "application/xml") else {
+        HttpError e => return r
+    }
+
+    return r
+}
+
+HttpResponse Xml(string body) {
+    r = HttpResponse.Text(200, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}")
+    r.Headers.Set("Content-Type", "application/xml") else {
+        HttpError e => return r
+    }
+
+    return r
+}
+
+// A bucket's name as S3 takes it: 3 to 63 bytes of lower-case letters, digits, dots and hyphens.
+bool ValidBucket(string name) {
+    if name.Bytes.Count < 3 || name.Bytes.Count > 63 {
+        return false
+    }
+
+    for b in name.Bytes {
+        if !(b >= 97 && b <= 122 || b >= 48 && b <= 57 || b == 46 || b == 45) {
+            return false
+        }
+    }
+
+    return true
+}
+
+string Escape(string text) => text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;")
+
+// The value of a hex digit, or -1 where `c` is none.
+HttpResponse ListBuckets(string root) {
+    names = Directory.List(root) else {
+        IoError e => return Failure(500, "InternalError", "The buckets could not be listed.")
+    }
+
+    mut items = ""
+    for s in names {
+        made = File.Modified("{root}/{s}") else {
+            IoError e => return Failure(500, "InternalError", "The buckets could not be listed.")
+        }
+
+        items = "{items}<Bucket><Name>{Escape(s)}</Name><CreationDate>{made}</CreationDate></Bucket>"
+    }
+
+    return Xml("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Buckets>{items}</Buckets></ListAllMyBucketsResult>")
+}
+
+HttpResponse ListObjects(string bucket, string dir, HttpQuery query) {
+    prefix = query.Get("prefix") ?? ""
+    delimiter = query.Get("delimiter") ?? ""
+    mut most = 1000
+    asked = query.Get("max-keys")
+    if asked != null {
+        n = int.Parse(asked) else {
+            ParseError e => return Failure(400, "InvalidArgument", "The max-keys is no number.")
+        }
+
+        if n >= 0 && n < most {
+            most = n
+        }
+    }
+
+    names = Directory.List(dir) else {
+        IoError e => return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    mut keys = List<string>()
+    for s in names {
+        if s.StartsWith("o-") {
+            key = Hex.Decode(s.Substring(2, s.Bytes.Count - 2)) else {
+                HexError e => continue
+            }
+
+            text = string.FromUtf8(key) else {
+                InvalidUtf8 => continue
+            }
+
+            if text.StartsWith(prefix) {
+                keys.Add(text)
+            }
+        }
+    }
+
+    keys.Sort()
+    mut items = ""
+    mut commons = List<string>()
+    mut count = 0
+    mut truncated = false
+    for key in keys {
+        if delimiter != "" {
+            after = key.Substring(prefix.Bytes.Count, key.Bytes.Count - prefix.Bytes.Count)
+            at = after.IndexOf(delimiter)
+            if at != null {
+                common = key.Substring(0, prefix.Bytes.Count + at + delimiter.Bytes.Count)
+                if commons.Count == 0 || commons[commons.Count - 1] != common {
+                    if count >= most {
+                        truncated = true
+                        break
+                    }
+
+                    commons.Add(common)
+                    count = count + 1
+                }
+
+                continue
+            }
+        }
+
+        if count >= most {
+            truncated = true
+            break
+        }
+
+        file = "{dir}/o-{Hex.Encode(key.Bytes)}"
+        size = File.Size(file) else {
+            IoError e => continue
+        }
+
+        modified = File.Modified(file) else {
+            IoError e => continue
+        }
+
+        tag = File.ReadAll("{dir}/e-{Hex.Encode(key.Bytes)}") else {
+            IoError e => continue
+        }
+
+        etag = string.FromUtf8(tag) else {
+            InvalidUtf8 => ""
+        }
+
+        items = "{items}<Contents><Key>{Escape(key)}</Key><LastModified>{modified}</LastModified><ETag>{Escape(etag)}</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+        count = count + 1
+    }
+
+    for common in commons {
+        items = "{items}<CommonPrefixes><Prefix>{Escape(common)}</Prefix></CommonPrefixes>"
+    }
+
+    return Xml("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{Escape(bucket)}</Name><Prefix>{Escape(prefix)}</Prefix><Delimiter>{Escape(delimiter)}</Delimiter><KeyCount>{count}</KeyCount><MaxKeys>{most}</MaxKeys><IsTruncated>{truncated}</IsTruncated>{items}</ListBucketResult>")
+}
+
+// The body to the file at `path`, through MD5 and SHA-256 as it comes: the hex of its MD5, or the failure S3 answers. A body
+// whose SHA-256 is not the one the client signed is deleted.
+string | HttpResponse Receive(HttpRequest r, string path, string payload) {
+    out = File.Create(path) else {
+        IoError e => return Failure(500, "InternalError", "The object could not be written.")
+    }
+
+    mut md5 = Md5.New()
+    mut sha = Sha256.New()
+    mut buffer = Bytes()
+    while true {
+        buffer.Clear()
+        n = r.Body.Read(mut buffer, 65536) else {
+            IoError e => return Failure(500, "InternalError", "The body could not be read.")
+            HttpError e => return Failure(400, "IncompleteBody", "The body could not be read.")
+        }
+
+        if n == 0 {
+            break
+        }
+
+        md5.Update(buffer)
+        sha.Update(buffer)
+        out.Write(buffer) else {
+            IoError e => return Failure(500, "InternalError", "The object could not be written.")
+        }
+    }
+
+    if payload != "UNSIGNED-PAYLOAD" && !FixedTime.Equal(payload.Bytes, Hex.Encode(sha.Finish()).Bytes) {
+        File.Delete(path) else {
+            IoError e => {
+            }
+        }
+
+        return Failure(400, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
+    }
+
+    return Hex.Encode(md5.Finish())
+}
+
+HttpResponse Put(HttpRequest r, string dir, string key, string payload) {
+    exists = File.Exists(dir) else {
+        IoError e => return Failure(500, "InternalError", "The bucket could not be read.")
+    }
+
+    if !exists {
+        return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    name = Hex.Encode(key.Bytes)
+    md5 = Receive(r, "{dir}/t-{name}", payload) else {
+        HttpResponse f => return f
+    }
+
+    etag = "\"{md5}\""
+    failed = Commit(dir, name, etag)
+    if failed != null {
+        return failed
+    }
+
+    return Tagged(etag)
+}
+
+// The object written at `t-<name>` made the one the key names, with its ETag, or the failure.
+HttpResponse? Commit(string dir, string name, string etag) {
+    File.WriteAll("{dir}/e-{name}", etag.Bytes) else {
+        IoError e => return Failure(500, "InternalError", "The object could not be written.")
+    }
+
+    File.Rename("{dir}/t-{name}", "{dir}/o-{name}") else {
+        IoError e => return Failure(500, "InternalError", "The object could not be written.")
+    }
+
+    return null
+}
+
+HttpResponse Tagged(string etag) {
+    done = HttpResponse.Empty(200)
+    done.Headers.Set("ETag", etag) else {
+        HttpError e => return done
+    }
+
+    return done
+}
+
+// A multipart upload's directory, `u-<id>` beside the objects, or null where the id is no id this server made or names an
+// upload of another key: an id is 32 hex digits, so that it names no other path.
+string? Upload(string dir, string key, string id) {
+    if id.Bytes.Count != 32 {
+        return null
+    }
+
+    for b in id.Bytes {
+        if !(b >= 48 && b <= 57 || b >= 97 && b <= 102) {
+            return null
+        }
+    }
+
+    upload = "{dir}/u-{id}"
+    held = File.ReadAll("{upload}/key") else {
+        IoError e => return null
+    }
+
+    if string.FromUtf8Lossy(held) != key {
+        return null
+    }
+
+    return upload
+}
+
+HttpResponse NoUpload() => Failure(404, "NoSuchUpload", "The specified multipart upload does not exist.")
+
+HttpResponse StartUpload(string bucket, string dir, string key) {
+    exists = File.Exists(dir) else {
+        IoError e => return Failure(500, "InternalError", "The bucket could not be read.")
+    }
+
+    if !exists {
+        return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    id = Hex.Encode(Sha256.Hash("{key}\n{timestamp.Now}".Bytes)).Substring(0, 32)
+    Directory.Create("{dir}/u-{id}") else {
+        IoError e => return Failure(500, "InternalError", "The upload could not be made.")
+    }
+
+    File.WriteAll("{dir}/u-{id}/key", key.Bytes) else {
+        IoError e => return Failure(500, "InternalError", "The upload could not be made.")
+    }
+
+    return Xml("<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{Escape(bucket)}</Bucket><Key>{Escape(key)}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>")
+}
+
+HttpResponse PutPart(HttpRequest r, string dir, string key, string id, string number, string payload) {
+    upload = Upload(dir, key, id)
+    if upload == null {
+        return NoUpload()
+    }
+
+    n = int.Parse(number) else {
+        ParseError e => return Failure(400, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive.")
+    }
+
+    if n < 1 || n > 10000 {
+        return Failure(400, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive.")
+    }
+
+    md5 = Receive(r, "{upload}/t-{n}", payload) else {
+        HttpResponse f => return f
+    }
+
+    File.WriteAll("{upload}/e-{n}", md5.Bytes) else {
+        IoError e => return Failure(500, "InternalError", "The part could not be written.")
+    }
+
+    File.Rename("{upload}/t-{n}", "{upload}/p-{n}") else {
+        IoError e => return Failure(500, "InternalError", "The part could not be written.")
+    }
+
+    return Tagged("\"{md5}\"")
+}
+
+// The part numbers of a CompleteMultipartUpload body, in its order, or null where one is no number. The body is read by its
+// `<PartNumber>` elements alone: std has no XML reader, as Rust's std has none.
+List<int>? PartNumbers(string text) {
+    open = "<PartNumber>"
+    mut numbers = List<int>()
+    mut rest = text
+    while true {
+        at = rest.IndexOf(open)
+        if at == null {
+            return numbers
+        }
+
+        after = rest.Substring(at + open.Bytes.Count, rest.Bytes.Count - at - open.Bytes.Count)
+        end = after.IndexOf("</PartNumber>")
+        if end == null {
+            return null
+        }
+
+        n = int.Parse(after.Substring(0, end)) else {
+            ParseError e => return null
+        }
+
+        numbers.Add(n)
+        rest = after.Substring(end, after.Bytes.Count - end)
+    }
+
+    // never reached: the checker takes the end of `while true` as reachable (F3 says C#'s rules, under which it is not)
+    return numbers
+}
+
+void | IoError Append(File out, string path) {
+    f = File.Open(path)
+    mut buffer = Bytes()
+    while true {
+        buffer.Clear()
+        n = f.Read(mut buffer, 65536)
+        if n == 0 {
+            return
+        }
+
+        out.Write(buffer)
+    }
+}
+
+void Drop(string upload, List<int> numbers) {
+    for n in numbers {
+        File.Delete("{upload}/p-{n}") else {
+            IoError e => {
+            }
+        }
+
+        File.Delete("{upload}/e-{n}") else {
+            IoError e => {
+            }
+        }
+    }
+
+    File.Delete("{upload}/key") else {
+        IoError e => {
+        }
+    }
+
+    Directory.Delete(upload) else {
+        IoError e => {
+        }
+    }
+}
+
+HttpResponse Complete(HttpRequest r, string bucket, string dir, string key, string id) {
+    upload = Upload(dir, key, id)
+    if upload == null {
+        return NoUpload()
+    }
+
+    text = r.Body.ReadAllText(1_000_000) else {
+        IoError e => return Failure(500, "InternalError", "The body could not be read.")
+        HttpError e => return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+        InvalidUtf8 e => return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+    }
+
+    numbers = PartNumbers(text)
+    if numbers == null || numbers.Count == 0 {
+        return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+    }
+
+    for i in 1..<numbers.Count {
+        if numbers[i] <= numbers[i - 1] {
+            return Failure(400, "InvalidPartOrder", "The list of parts was not in ascending order.")
+        }
+    }
+
+    name = Hex.Encode(key.Bytes)
+    out = File.Create("{dir}/t-{name}") else {
+        IoError e => return Failure(500, "InternalError", "The object could not be written.")
+    }
+
+    mut digests = Bytes()
+    for n in numbers {
+        tag = File.ReadAll("{upload}/e-{n}") else {
+            IoError e => return Failure(400, "InvalidPart", "One or more of the specified parts could not be found.")
+        }
+
+        digest = Hex.Decode(string.FromUtf8Lossy(tag)) else {
+            HexError e => return Failure(500, "InternalError", "A part's ETag could not be read.")
+        }
+
+        digests.AddRange(digest)
+        Append(out, "{upload}/p-{n}") else {
+            IoError e => return Failure(500, "InternalError", "The object could not be written.")
+        }
+    }
+
+    etag = "\"{Hex.Encode(Md5.Hash(digests))}-{numbers.Count}\""
+    failed = Commit(dir, name, etag)
+    if failed != null {
+        return failed
+    }
+
+    Drop(upload, numbers)
+    return Xml("<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{Escape(bucket)}</Bucket><Key>{Escape(key)}</Key><ETag>{Escape(etag)}</ETag></CompleteMultipartUploadResult>")
+}
+
+HttpResponse Abort(string dir, string key, string id) {
+    upload = Upload(dir, key, id)
+    if upload == null {
+        return NoUpload()
+    }
+
+    names = Directory.List(upload) else {
+        IoError e => return Failure(500, "InternalError", "The upload could not be read.")
+    }
+
+    for s in names {
+        File.Delete("{upload}/{s}") else {
+            IoError e => {
+            }
+        }
+    }
+
+    Directory.Delete(upload) else {
+        IoError e => return Failure(500, "InternalError", "The upload could not be deleted.")
+    }
+
+    return HttpResponse.Empty(204)
+}
+
+// The text of an XML element's content, its five entities read back.
+string Unescape(string s) => s.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&quot;", "\"").Replace("&apos;", "'").Replace("&amp;", "&")
+
+// CopyObject: the object `x-amz-copy-source` names, `/bucket/key` or `bucket/key`, escaped, copied to the key.
+HttpResponse Copy(string root, string dir, string key, string source) {
+    decoded = Url.Decode(source) else {
+        InvalidUtf8 e => return Failure(400, "InvalidArgument", "Copy Source must mention the source bucket and key: sourcebucket/sourcekey.")
+    }
+
+    mut path = decoded
+    if path.StartsWith("/") {
+        path = path.Substring(1, path.Bytes.Count - 1)
+    }
+
+    from = Parse("/{path}")
+    if from.Bucket == "" || from.Key == "" || !ValidBucket(from.Bucket) {
+        return Failure(400, "InvalidArgument", "Copy Source must mention the source bucket and key: sourcebucket/sourcekey.")
+    }
+
+    sourceDir = "{root}/{from.Bucket}"
+    sourceName = Hex.Encode(from.Key.Bytes)
+    tag = File.ReadAll("{sourceDir}/e-{sourceName}") else {
+        IoError e => return Failure(404, "NoSuchKey", "The specified key does not exist.")
+    }
+
+    name = Hex.Encode(key.Bytes)
+    out = File.Create("{dir}/t-{name}") else {
+        IoError e => return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    Append(out, "{sourceDir}/o-{sourceName}") else {
+        IoError e => return Failure(404, "NoSuchKey", "The specified key does not exist.")
+    }
+
+    etag = string.FromUtf8Lossy(tag)
+    failed = Commit(dir, name, etag)
+    if failed != null {
+        return failed
+    }
+
+    modified = File.Modified("{dir}/o-{name}") else {
+        IoError e => return Failure(500, "InternalError", "The object could not be read.")
+    }
+
+    return Xml("<CopyObjectResult><LastModified>{modified}</LastModified><ETag>{Escape(etag)}</ETag></CopyObjectResult>")
+}
+
+// DeleteObjects: every `<Key>` of the body deleted, each named in the answer as S3 names it, `<Quiet>true</Quiet>` naming none.
+HttpResponse DeleteMany(HttpRequest r, string dir) {
+    text = r.Body.ReadAllText(2_000_000) else {
+        IoError e => return Failure(500, "InternalError", "The body could not be read.")
+        HttpError e => return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+        InvalidUtf8 e => return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+    }
+
+    quiet = text.Contains("<Quiet>true</Quiet>")
+    mut items = ""
+    mut rest = text
+    mut count = 0
+    while true {
+        at = rest.IndexOf("<Key>")
+        if at == null {
+            break
+        }
+
+        after = rest.Substring(at + 5, rest.Bytes.Count - at - 5)
+        end = after.IndexOf("</Key>")
+        if end == null {
+            return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+        }
+
+        key = Unescape(after.Substring(0, end))
+        rest = after.Substring(end, after.Bytes.Count - end)
+        count = count + 1
+        if count > 1000 {
+            return Failure(400, "MalformedXML", "The XML you provided was not well-formed.")
+        }
+
+        Delete(dir, key)
+        if !quiet {
+            items = "{items}<Deleted><Key>{Escape(key)}</Key></Deleted>"
+        }
+    }
+
+    return Xml("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{items}</DeleteResult>")
+}
+
+// The failure for a key that is not in the bucket `dir`: S3's NoSuchBucket where the bucket itself is missing.
+HttpResponse Missing(string dir) {
+    bucket = File.Exists(dir) else {
+        IoError e => return Failure(500, "InternalError", "The bucket could not be read.")
+    }
+
+    if !bucket {
+        return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    return Failure(404, "NoSuchKey", "The specified key does not exist.")
+}
+
+HttpResponse Get(string dir, string key, string? range) {
+    name = Hex.Encode(key.Bytes)
+    file = "{dir}/o-{name}"
+    exists = File.Exists(file) else {
+        IoError e => return Failure(500, "InternalError", "The object could not be read.")
+    }
+
+    if !exists {
+        return Missing(dir)
+    }
+
+    tag = File.ReadAll("{dir}/e-{name}") else {
+        IoError e => return Failure(500, "InternalError", "The object could not be read.")
+    }
+
+    etag = string.FromUtf8(tag) else {
+        InvalidUtf8 => ""
+    }
+
+    modified = File.Modified(file) else {
+        IoError e => return Failure(500, "InternalError", "The object could not be read.")
+    }
+
+    if range != null {
+        return Part(file, etag, range, modified)
+    }
+
+    found = HttpResponse.File(200, file)
+    found.Headers.Set("Last-Modified", HttpDate.Format(modified)) else {
+        HttpError e => return found
+    }
+
+    found.Headers.Set("ETag", etag) else {
+        HttpError e => return found
+    }
+
+    return found
+}
+
+HttpResponse Delete(string dir, string key) {
+    bucket = File.Exists(dir) else {
+        IoError e => return Failure(500, "InternalError", "The bucket could not be read.")
+    }
+
+    if !bucket {
+        return Failure(404, "NoSuchBucket", "The specified bucket does not exist.")
+    }
+
+    name = Hex.Encode(key.Bytes)
+    File.Delete("{dir}/o-{name}") else {
+        IoError e => {
+        }
+    }
+
+    File.Delete("{dir}/e-{name}") else {
+        IoError e => {
+        }
+    }
+
+    return HttpResponse.Empty(204)
+}
+
+// SigV4's canonical request: the method, the path, the query, each signed header with its value, the list of their names
+// and the payload's hash as the client sent it.
+string Canonical(HttpRequest r, List<string> signed, string payload) {
+    mut text = "{r.Method}\n{SigPath(r.Path)}\n{SigQuery(r)}\n"
+    for name in signed {
+        text = "{text}{name}:{(r.Headers.Get(name) ?? "").TrimAscii()}\n"
+    }
+
+    return "{text}\n{string.Join(";", signed)}\n{payload}"
+}
+
+// The path, each segment's bytes escaped as SigV4 escapes them: every byte but the unreserved ones, `/` kept.
+string SigPath(string path) {
+    mut out = List<string>()
+    for p in path.Split("/") {
+        decoded = Url.Decode(p) else {
+            InvalidUtf8 e => p
+        }
+
+        out.Add(Url.Encode(decoded))
+    }
+
+    return string.Join("/", out)
+}
+
+// The query, its pairs sorted by name, then value, each escaped.
+string SigQuery(HttpRequest r) {
+    q = r.QueryValues()
+    mut pairs = List<string>()
+    for i in 0..<q.Count {
+        pairs.Add("{Url.Encode(q.NameAt(i))}={Url.Encode(q.ValueAt(i))}")
+    }
+
+    pairs.Sort()
+    return string.Join("&", pairs)
+}
+
+Bytes Mac(Bytes key, string text) => Hmac.Sha256(key, text.Bytes)
+
+string Signature(string secret, string date, string region, string service, string toSign) {
+    k1 = Mac("AWS4{secret}".Bytes, date)
+    k2 = Mac(k1, region)
+    k3 = Mac(k2, service)
+    k4 = Mac(k3, "aws4_request")
+    return Hex.Encode(Mac(k4, toSign))
+}
+
+// The days from 1970-01-01 to a date of the proleptic Gregorian calendar, the year 0 or later.
+long DaysFromCivil(long year, long month, long day) {
+    mut y = year
+    mut m = month + 9
+    if month <= 2 {
+        y = year - 1
+    } else {
+        m = month - 3
+    }
+
+    era = y / 400
+    yoe = y - era * 400
+    doy = (153 * m + 2) / 5 + day - 1
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// `x-amz-date`'s form, yyyyMMddTHHmmssZ, as the time it names, or null where it is not that form.
+timestamp? AmzTime(string d) {
+    if d.Bytes.Count != 16 || d.Substring(8, 1) != "T" || d.Substring(15, 1) != "Z" {
+        return null
+    }
+
+    year = int.Parse(d.Substring(0, 4)) else {
+        ParseError e => return null
+    }
+    month = int.Parse(d.Substring(4, 2)) else {
+        ParseError e => return null
+    }
+    day = int.Parse(d.Substring(6, 2)) else {
+        ParseError e => return null
+    }
+    hour = int.Parse(d.Substring(9, 2)) else {
+        ParseError e => return null
+    }
+    minute = int.Parse(d.Substring(11, 2)) else {
+        ParseError e => return null
+    }
+    second = int.Parse(d.Substring(13, 2)) else {
+        ParseError e => return null
+    }
+
+    if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+        return null
+    }
+
+    days = DaysFromCivil(year, month, day)
+    return timestamp.FromUnixSeconds(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+// SigV4 in the header form: the request's signature against the one the secret gives, or the failure S3 answers. The date is
+// held to the clock within 15 minutes either way, as S3 holds it.
+HttpResponse? Authorize(HttpRequest r, string key, string secret) {
+    auth = r.Headers.Get("authorization")
+    if auth == null {
+        return Failure(403, "AccessDenied", "Access Denied")
+    }
+
+    scheme = "AWS4-HMAC-SHA256 "
+    if !auth.StartsWith(scheme) {
+        return Failure(400, "InvalidArgument", "Unsupported Authorization Type")
+    }
+
+    mut credential = ""
+    mut signedText = ""
+    mut signature = ""
+    for piece in auth.Substring(scheme.Bytes.Count, auth.Bytes.Count - scheme.Bytes.Count).Split(",") {
+        part = piece.TrimAscii()
+        at = part.IndexOf("=")
+        if at == null {
+            continue
+        }
+
+        name = part.Substring(0, at)
+        value = part.Substring(at + 1, part.Bytes.Count - at - 1)
+        if name == "Credential" {
+            credential = value
+        } else if name == "SignedHeaders" {
+            signedText = value
+        } else if name == "Signature" {
+            signature = value
+        }
+    }
+
+    scope = credential.Split("/")
+    if scope.Count != 5 || scope[4] != "aws4_request" || signedText == "" || signature == "" {
+        return Failure(400, "AuthorizationHeaderMalformed", "The authorization header is malformed.")
+    }
+
+    if scope[0] != key {
+        return Failure(403, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
+    }
+
+    date = r.Headers.Get("x-amz-date") ?? ""
+    if date.Bytes.Count != 16 || !date.StartsWith(scope[1]) {
+        return Failure(403, "AccessDenied", "The request's date does not match its credential.")
+    }
+
+    sent = AmzTime(date)
+    if sent == null {
+        return Failure(403, "AccessDenied", "The request's x-amz-date is no date.")
+    }
+
+    skew = timestamp.Now - sent
+    if skew > 15min || skew < -15min {
+        return Failure(403, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.")
+    }
+
+    payload = r.Headers.Get("x-amz-content-sha256") ?? ""
+    if payload == "" {
+        return Failure(400, "InvalidRequest", "Missing required header for this request: x-amz-content-sha256")
+    }
+
+    canonical = Canonical(r, signedText.Split(";"), payload)
+    toSign = "AWS4-HMAC-SHA256\n{date}\n{scope[1]}/{scope[2]}/{scope[3]}/aws4_request\n{Hex.Encode(Sha256.Hash(canonical.Bytes))}"
+    if !FixedTime.Equal(Signature(secret, scope[1], scope[2], scope[3], toSign).Bytes, signature.Bytes) {
+        return Failure(403, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
+    }
+
+    return null
+}
+
+HttpResponse Unsatisfiable(long size) {
+    r = Failure(416, "InvalidRange", "The requested range is not satisfiable")
+    r.Headers.Set("Content-Range", "bytes */{size}") else {
+        HttpError e => return r
+    }
+
+    return r
+}
+
+// A part of the object as one range of a `Range` header asks for it: `bytes=a-b`, `bytes=a-` or `bytes=-n`. The file seeks to
+// the range (S27) and the part goes out with its length (W11), not in chunks.
+HttpResponse Part(string file, string etag, string range, timestamp modified) {
+    size = File.Size(file) else {
+        IoError e => return Failure(500, "InternalError", "The object could not be read.")
+    }
+
+    if !range.StartsWith("bytes=") || range.IndexOf(",") != null {
+        return Unsatisfiable(size)
+    }
+
+    spec = range.Substring(6, range.Bytes.Count - 6)
+    dash = spec.IndexOf("-")
+    if dash == null {
+        return Unsatisfiable(size)
+    }
+
+    first = spec.Substring(0, dash)
+    last = spec.Substring(dash + 1, spec.Bytes.Count - dash - 1)
+    mut long from = 0
+    mut long to = size - 1
+    if first == "" {
+        n = long.Parse(last) else {
+            ParseError e => return Unsatisfiable(size)
+        }
+
+        if n == 0 {
+            return Unsatisfiable(size)
+        }
+
+        if n < size {
+            from = size - n
+        }
+    } else {
+        from = long.Parse(first) else {
+            ParseError e => return Unsatisfiable(size)
+        }
+
+        if last != "" {
+            to = long.Parse(last) else {
+                ParseError e => return Unsatisfiable(size)
+            }
+
+            if to >= size {
+                to = size - 1
+            }
+        }
+    }
+
+    if from >= size || from > to {
+        return Unsatisfiable(size)
+    }
+
+    r = HttpResponse.Stream(206, (HttpWriter w) => SendPart(w, file, from, to - from + 1))
+    r.Headers.Set("Content-Range", "bytes {from}-{to}/{size}") else {
+        HttpError e => return r
+    }
+
+    r.Headers.Set("Content-Length", "{to - from + 1}") else {
+        HttpError e => return r
+    }
+
+    r.Headers.Set("ETag", etag) else {
+        HttpError e => return r
+    }
+
+    r.Headers.Set("Last-Modified", HttpDate.Format(modified)) else {
+        HttpError e => return r
+    }
+
+    return r
+}
+
+void | IoError SendPart(HttpWriter w, string file, long from, long count) {
+    f = File.Open(file)
+    f.Seek(from)
+    mut buffer = Bytes()
+    mut long left = count
+    while left > 0 {
+        buffer.Clear()
+        mut take = 65536
+        if left < 65536 {
+            take = int(left)
+        }
+
+        n = f.Read(mut buffer, take)
+        if n == 0 {
+            return
+        }
+
+        w.Write(buffer)
+        left = left - n
+    }
+}
+
+HttpResponse Handle(HttpRequest r, string root, string key, string secret) {
+    denied = Authorize(r, key, secret)
+    if denied != null {
+        return denied
+    }
+
+    path = Url.Decode(r.Path) else {
+        InvalidUtf8 e => return Failure(400, "InvalidURI", "Couldn't parse the specified URI.")
+    }
+
+    t = Parse(path)
+    if t.Bucket == "" {
+        if r.Method == "GET" {
+            return ListBuckets(root)
+        }
+
+        return Failure(405, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+    }
+
+    if !ValidBucket(t.Bucket) {
+        return Failure(400, "InvalidBucketName", "The specified bucket is not valid.")
+    }
+
+    dir = "{root}/{t.Bucket}"
+    if t.Key == "" {
+        if r.Method == "PUT" {
+            Directory.Create(dir) else {
+                IoError e => return Failure(500, "InternalError", "The bucket could not be made.")
+            }
+
+            return HttpResponse.Empty(200)
+        }
+
+        if r.Method == "POST" && r.QueryValues().Get("delete") != null {
+            return DeleteMany(r, dir)
+        }
+
+        if r.Method == "GET" {
+            return ListObjects(t.Bucket, dir, r.QueryValues())
+        }
+
+        if r.Method == "DELETE" {
+            Directory.Delete(dir) else {
+                IoError e => return Failure(409, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
+            }
+
+            return HttpResponse.Empty(204)
+        }
+
+        return Failure(405, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+    }
+
+    q = r.QueryValues()
+    payload = r.Headers.Get("x-amz-content-sha256") ?? ""
+    if r.Method == "POST" && q.Get("uploads") != null {
+        return StartUpload(t.Bucket, dir, t.Key)
+    }
+
+    id = q.Get("uploadId")
+    if id != null {
+        if r.Method == "PUT" {
+            return PutPart(r, dir, t.Key, id, q.Get("partNumber") ?? "", payload)
+        }
+
+        if r.Method == "POST" {
+            return Complete(r, t.Bucket, dir, t.Key, id)
+        }
+
+        if r.Method == "DELETE" {
+            return Abort(dir, t.Key, id)
+        }
+    }
+
+    if r.Method == "PUT" {
+        source = r.Headers.Get("x-amz-copy-source")
+        if source != null {
+            return Copy(root, dir, t.Key, source)
+        }
+
+        return Put(r, dir, t.Key, payload)
+    }
+
+    if r.Method == "GET" || r.Method == "HEAD" {
+        return Get(dir, t.Key, r.Headers.Get("range"))
+    }
+
+    if r.Method == "DELETE" {
+        return Delete(dir, t.Key)
+    }
+
+    return Failure(405, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+}
+
+void | IoError Main(string address, string root, string key, string secret) {
+    Directory.Create(root)
+    listener = TcpListener.Bind(address)
+    print("listening on {address}, root {root}")
+    // one connection at a time: a connection ends after its one request, so that a client's second connection does not wait
+    // out the first one's keep-alive
+    HttpServer.Serve(listener, (HttpRequest r) => Handle(r, root, key, secret), HttpLimits(MaxRequestsPerConnection: 1))
+}
+
+// The variable `name` of the environment, which must be set and not empty.
+string | EnvError Required(string name) {
+    value = Environment.Variable(name)
+    if value == "" {
+        return EnvError(EnvKind.NotPresent, name)
+    }
+
+    return value
+}
+
+// The variable `name` of the environment, or `fallback` where it is not set; a value that is not UTF-8 stays the error.
+string | EnvError Optional(string name, string fallback) {
+    value = Environment.Variable(name) else {
+        EnvError e => {
+            if e.Kind == EnvKind.NotPresent {
+                return fallback
+            }
+
+            return e
+        }
+    }
+
+    return value
+}
+
+// The server's settings, each from its variable, so that the secret is on no command line.
+void | IoError | EnvError Start() {
+    address = Optional("KURZ_S3_ADDRESS", "127.0.0.1:9000")
+    root = Required("KURZ_S3_ROOT")
+    key = Required("KURZ_S3_ACCESS_KEY")
+    secret = Required("KURZ_S3_SECRET_KEY")
+    Main(address, root, key, secret)
+}
+
+Start() else {
+    IoError e => print(e)
+    EnvError e => print("the server does not start: {e}")
+}
