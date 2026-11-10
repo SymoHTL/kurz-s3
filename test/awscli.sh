@@ -36,7 +36,7 @@ step "list buckets" s3 ls
 step "copy a small file up" s3 cp /tmp/small.txt s3://cli/small.txt
 step "copy a 9 MB file up, in parts" s3 cp /tmp/big.bin s3://cli/big.bin
 step "list the bucket" s3 ls s3://cli/
-step "the list holds both" grep -q big.bin /tmp/step.out
+step "the list holds both" sh -c "grep -q small.txt /tmp/step.out && grep -q big.bin /tmp/step.out"
 step "copy the small file down" s3 cp s3://cli/small.txt /tmp/small.back
 step "the small file has its bytes" cmp /tmp/small.txt /tmp/small.back
 step "get a range" s3api get-object --bucket cli --key small.txt --range bytes=0-4 /tmp/part.txt
