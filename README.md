@@ -3,7 +3,7 @@
 A small S3-style object server written in [Kurz](https://github.com/SymoHTL/Kurz), over the HTTP server of Kurz's
 standard library.
 
-Kurz commit: `a514840e9d92e14c9a697e4a08b6fa376d7cd388`
+Kurz commit: `16d446fb9a34629dbd700dba864bb105c0254f44`
 
 The server is built and tested with the Kurz compiler at that commit. The CI job reads the commit from the line above
 and fails when the README names none.
@@ -61,9 +61,10 @@ The server reads its settings from the environment, so that the secret is on no 
 | `KURZ_S3_ACCESS_KEY` | the access key | none |
 | `KURZ_S3_SECRET_KEY` | the key's secret | none |
 
-A variable with no default that is not set, or set to nothing, stops the start with a line that names it, such as
-`the server does not start: not present: KURZ_S3_ROOT`. The process then ends with the exit code 0: the compiler at
-that commit builds no `Environment.Exit`.
+A variable with no default that is not set, or set to nothing, stops the start with a line on standard error that
+names it, such as `the server does not start: not present: KURZ_S3_ROOT`, and the process ends with the exit code 1.
+A root that cannot be made, an address that cannot be bound and a listener that fails end it so too, with the error's
+line on standard error.
 
 ```sh
 export KURZ_S3_ROOT=./data KURZ_S3_ACCESS_KEY=AKIDEXAMPLE
