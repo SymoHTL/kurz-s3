@@ -63,8 +63,8 @@ The server reads its settings from the environment, so that the secret is on no 
 
 A variable with no default that is not set, or set to nothing, stops the start with a line on standard error that
 names it, such as `the server does not start: not present: KURZ_S3_ROOT`, and the process ends with the exit code 1.
-A root that cannot be made, an address that cannot be bound and a listener that fails end it so too, with the error's
-line on standard error.
+A root that cannot be made and an address that cannot be bound end it so too, with the error's line on standard
+error.
 
 ```sh
 export KURZ_S3_ROOT=./data KURZ_S3_ACCESS_KEY=AKIDEXAMPLE

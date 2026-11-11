@@ -25,6 +25,8 @@ expect() {
 expect "no root" "the server does not start: not present: KURZ_S3_ROOT" -u KURZ_S3_ROOT
 expect "an empty root" "the server does not start: not present: KURZ_S3_ROOT" KURZ_S3_ROOT=
 expect "no access key" "the server does not start: not present: KURZ_S3_ACCESS_KEY" -u KURZ_S3_ACCESS_KEY KURZ_S3_ROOT="$work/root"
+: > "$work/file"
+expect "a root that cannot be made" "not a directory: $work/file/root" KURZ_S3_ROOT="$work/file/root"
 expect "an address in use" "address in use: 127.0.0.1:9000" KURZ_S3_ROOT="$work/root" KURZ_S3_ADDRESS=127.0.0.1:9000
 
 [ "$fails" = 0 ]
