@@ -1046,7 +1046,14 @@ void | IoError | EnvError Start() {
     Main(address, root, key, secret)
 }
 
+// A start that fails, and a listener that fails, end the process with the exit code 1 and their line on standard error.
 Start() else {
-    IoError e => print(e)
-    EnvError e => print("the server does not start: {e}")
+    IoError e => {
+        eprint(e)
+        return 1
+    }
+    EnvError e => {
+        eprint("the server does not start: {e}")
+        return 1
+    }
 }
